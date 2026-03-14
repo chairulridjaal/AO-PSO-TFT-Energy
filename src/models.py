@@ -762,18 +762,31 @@ class BaseTFT(nn.Module):
         # ── 8. Temporal Self-Attention ──────────────────────────────
         # Multi-layer Transformer encoder with multi-head attention
         # and position-wise feed-forward networks.
-        encoder_layer = nn.TransformerEncoderLayer(
+        # enable_nested_tensor was removed in PyTorch 2.10+; only pass
+        # it on older versions where it defaults to True and can cause
+        # issues with custom attention masks.
+        _enc_kwargs = dict(
             d_model=d_model,
             nhead=n_heads,
             dim_feedforward=d_model * 4,
             dropout=dropout,
             batch_first=True,
-            enable_nested_tensor=False,
         )
-        self.transformer = nn.TransformerEncoder(
-            encoder_layer,
+        import inspect as _inspect
+        if "enable_nested_tensor" in _inspect.signature(
+            nn.TransformerEncoderLayer.__init__
+        ).parameters:
+            _enc_kwargs["enable_nested_tensor"] = False
+        encoder_layer = nn.TransformerEncoderLayer(**_enc_kwargs)
+        _te_kwargs = dict(
+            encoder_layer=encoder_layer,
             num_layers=num_encoder_layers,
         )
+        if "enable_nested_tensor" in _inspect.signature(
+            nn.TransformerEncoder.__init__
+        ).parameters:
+            _te_kwargs["enable_nested_tensor"] = False
+        self.transformer = nn.TransformerEncoder(**_te_kwargs)
 
         # Post-attention GRN with gated skip from pre-transformer
         self.post_attn_grn = GatedResidualNetwork(d_model, dropout=dropout)
