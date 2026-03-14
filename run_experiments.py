@@ -64,6 +64,7 @@ TOTAL_ITER      = 50      # For Hybrid (AO + PSO combined)
 AO_FRACTION     = 0.5
 PROXY_EPOCHS    = 2
 SUBSET_FRACTION = 0.3
+VAL_SUBSET_FRAC = 0.1     # Validation subset for proxy evals (speed hack)
 
 # Full TFT training after optimization
 FULL_EPOCHS     = 30
@@ -454,6 +455,7 @@ def run_swarms(log):
     config = {
         "n_runs": N_RUNS, "pop_size": POP_SIZE, "max_iter": MAX_ITER,
         "proxy_epochs": PROXY_EPOCHS, "subset_fraction": SUBSET_FRACTION,
+        "val_subset_fraction": VAL_SUBSET_FRAC,
         "full_epochs": FULL_EPOCHS, "patience": PATIENCE,
         "window_size": WINDOW_SIZE, "horizon": HORIZON, "batch_size": BATCH_SIZE,
     }
@@ -462,6 +464,8 @@ def run_swarms(log):
     log.info("  PHASE 2: STANDALONE SWARM EVALUATION (Pure AO, Pure PSO)")
     log.info("  Device: %s | N_RUNS: %d | POP: %d | ITER: %d",
              device, N_RUNS, POP_SIZE, MAX_ITER)
+    log.info("  [System] Using val_subset_fraction=%.1f and num_workers=%d "
+             "for proxy evaluations.", VAL_SUBSET_FRAC, NUM_WORKERS)
     log.info("=" * 70)
 
     optimizers_to_run = [
@@ -501,7 +505,8 @@ def run_swarms(log):
                     train_loader=train_loader, val_loader=val_loader,
                     n_encoder_features=n_features, window_size=WINDOW_SIZE,
                     horizon=HORIZON, proxy_epochs=PROXY_EPOCHS,
-                    subset_fraction=SUBSET_FRACTION, device=device,
+                    subset_fraction=SUBSET_FRACTION,
+                    val_subset_fraction=VAL_SUBSET_FRAC, device=device,
                 )
                 swarm = opt_class(
                     objective_fn=obj_fn, pop_size=POP_SIZE,
@@ -603,15 +608,17 @@ def run_hybrid(log):
     config = {
         "n_runs": N_RUNS, "pop_size": POP_SIZE, "total_iter": TOTAL_ITER,
         "ao_fraction": AO_FRACTION, "proxy_epochs": PROXY_EPOCHS,
-        "subset_fraction": SUBSET_FRACTION, "full_epochs": FULL_EPOCHS,
-        "patience": PATIENCE, "window_size": WINDOW_SIZE,
-        "horizon": HORIZON, "batch_size": BATCH_SIZE,
+        "subset_fraction": SUBSET_FRACTION, "val_subset_fraction": VAL_SUBSET_FRAC,
+        "full_epochs": FULL_EPOCHS, "patience": PATIENCE,
+        "window_size": WINDOW_SIZE, "horizon": HORIZON, "batch_size": BATCH_SIZE,
     }
 
     log.info("=" * 70)
     log.info("  PHASE 3: CHAMPION EVALUATION (Hybrid AO-PSO)")
     log.info("  Device: %s | N_RUNS: %d | POP: %d | TOTAL_ITER: %d | AO_FRAC: %.1f",
              device, N_RUNS, POP_SIZE, TOTAL_ITER, AO_FRACTION)
+    log.info("  [System] Using val_subset_fraction=%.1f and num_workers=%d "
+             "for proxy evaluations.", VAL_SUBSET_FRAC, NUM_WORKERS)
     log.info("=" * 70)
 
     model_name = "Hybrid_AO_PSO"
@@ -647,7 +654,8 @@ def run_hybrid(log):
                 train_loader=train_loader, val_loader=val_loader,
                 n_encoder_features=n_features, window_size=WINDOW_SIZE,
                 horizon=HORIZON, proxy_epochs=PROXY_EPOCHS,
-                subset_fraction=SUBSET_FRACTION, device=device,
+                subset_fraction=SUBSET_FRACTION,
+                val_subset_fraction=VAL_SUBSET_FRAC, device=device,
             )
             hybrid = Hybrid_AO_PSO(
                 objective_fn=obj_fn, pop_size=POP_SIZE,
