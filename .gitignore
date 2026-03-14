@@ -1,0 +1,8 @@
+*.pyc
+/bundles
+/archive
+/walkthroughs
+/notebooklm
+find_best_vast_instance.py
+MASTER_BLUEPRINT.md
+data/household_raw/household_power_consumption.txt
