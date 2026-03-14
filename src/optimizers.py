@@ -285,7 +285,7 @@ class ObjectiveFunction:
     train_loader : DataLoader
         Full training DataLoader (batches are sub-sampled internally).
     val_loader : DataLoader
-        Full validation DataLoader (evaluated entirely for RMSE).
+        Full validation DataLoader (sub-sampled via ``val_subset_fraction``).
     n_encoder_features : int
         Number of continuous input features (F in ``(B, T, F)``).
     window_size : int
@@ -296,6 +296,9 @@ class ObjectiveFunction:
         Number of training epochs per fitness evaluation (default 2).
     subset_fraction : float
         Fraction of training batches used per evaluation (default 0.3).
+    val_subset_fraction : float
+        Fraction of validation batches used per evaluation (default 1.0).
+        Set lower for smoke tests to reduce evaluation time.
     device : str
         PyTorch device string (default "cuda" if available).
     """
@@ -309,6 +312,7 @@ class ObjectiveFunction:
         horizon: int = 24,
         proxy_epochs: int = 2,
         subset_fraction: float = 0.3,
+        val_subset_fraction: float = 1.0,
         device: Optional[str] = None,
     ):
         self.train_loader = train_loader
@@ -318,6 +322,7 @@ class ObjectiveFunction:
         self.horizon = horizon
         self.proxy_epochs = proxy_epochs
         self.subset_fraction = subset_fraction
+        self.val_subset_fraction = val_subset_fraction
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
         # Pre-compute which training batch indices to use.
@@ -329,11 +334,29 @@ class ObjectiveFunction:
         self._subset_indices = sorted(
             self._rng.choice(n_batches, size=n_subset, replace=False).tolist()
         )
+
+        # Pre-compute which validation batch indices to use.
+        n_val_batches = len(val_loader)
+        if val_subset_fraction < 1.0:
+            n_val_subset = max(1, int(n_val_batches * val_subset_fraction))
+            self._val_subset_indices: Optional[set] = set(sorted(
+                self._rng.choice(
+                    n_val_batches, size=n_val_subset, replace=False
+                ).tolist()
+            ))
+        else:
+            n_val_subset = n_val_batches
+            self._val_subset_indices = None  # Use all
+
         logger.info(
             "[ObjectiveFunction] Using %d/%d training batches (%.0f%%) "
             "x %d proxy epochs on device='%s'",
             n_subset, n_batches, subset_fraction * 100,
             proxy_epochs, self.device,
+        )
+        logger.info(
+            "[ObjectiveFunction] Using %d/%d validation batches (%.0f%%)",
+            n_val_subset, n_val_batches, val_subset_fraction * 100,
         )
 
     def __call__(self, position: np.ndarray) -> float:
@@ -405,7 +428,11 @@ class ObjectiveFunction:
             val_count = 0
 
             with torch.no_grad():
-                for x_cont, x_cat, y in self.val_loader:
+                for val_idx, (x_cont, x_cat, y) in enumerate(self.val_loader):
+                    if (self._val_subset_indices is not None
+                            and val_idx not in self._val_subset_indices):
+                        continue
+
                     x_cont = x_cont.to(self.device)
                     y = y.to(self.device)
 
