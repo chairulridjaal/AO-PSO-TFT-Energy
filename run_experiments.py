@@ -320,8 +320,165 @@ def predict_model(model, test_loader, device):
 # =====================================================================
 # Phase 1: Baselines (Notebook 01)
 # =====================================================================
-def run_baselines(log):
-    """Execute LSTM, BiLSTM, XGBoost on both datasets with checkpointing."""
+
+def _baseline_worker(args_dict):
+    """
+    Execute a single baseline run on a specific GPU.
+
+    Designed to run in a separate process via ProcessPoolExecutor.
+    Returns the result dict or None on failure.
+    """
+    import torch
+    import torch.nn as nn
+    import numpy as np
+
+    run        = args_dict["run"]
+    model_name = args_dict["model_name"]
+    is_xgb     = args_dict["is_xgb"]
+    gpu_id     = args_dict["gpu_id"]
+    n_features = args_dict["n_features"]
+    horizon    = args_dict["horizon"]
+    ds_key     = args_dict["ds_key"]
+
+    # Reconstruct data from shared arrays
+    train_X = args_dict["train_X"]
+    train_y = args_dict["train_y"]
+    test_X  = args_dict["test_X"]
+    test_y  = args_dict["test_y"]
+    val_X   = args_dict.get("val_X")
+    val_y   = args_dict.get("val_y")
+
+    device = f"cuda:{gpu_id}"
+
+    try:
+        t0 = time.time()
+
+        if is_xgb:
+            from src.models import XGBoostBaseline
+            model = XGBoostBaseline(horizon=horizon, device=device)
+            model.fit(train_X, train_y)
+            preds_scaled   = model.predict(test_X)
+            targets_scaled = test_y
+        else:
+            from src.models import StandardLSTM, BiLSTM
+            model_cls = StandardLSTM if model_name == "StandardLSTM" else BiLSTM
+            model = model_cls(
+                n_features=n_features,
+                hidden_size=args_dict["hidden_size"],
+                num_layers=args_dict["num_layers"],
+                dropout=args_dict["dropout"],
+                horizon=horizon,
+            )
+            # Build mini DataLoaders from numpy arrays
+            train_dataset = torch.utils.data.TensorDataset(
+                torch.from_numpy(train_X).float(),
+                torch.zeros(len(train_X)),  # dummy x_cat
+                torch.from_numpy(train_y).float(),
+            )
+            val_dataset = torch.utils.data.TensorDataset(
+                torch.from_numpy(val_X).float(),
+                torch.zeros(len(val_X)),
+                torch.from_numpy(val_y).float(),
+            )
+            test_dataset = torch.utils.data.TensorDataset(
+                torch.from_numpy(test_X).float(),
+                torch.zeros(len(test_X)),
+                torch.from_numpy(test_y).float(),
+            )
+            train_loader = torch.utils.data.DataLoader(
+                train_dataset, batch_size=args_dict["batch_size"], shuffle=True,
+            )
+            val_loader = torch.utils.data.DataLoader(
+                val_dataset, batch_size=args_dict["batch_size"], shuffle=False,
+            )
+            test_loader = torch.utils.data.DataLoader(
+                test_dataset, batch_size=args_dict["batch_size"], shuffle=False,
+            )
+
+            model = model.to(device)
+            optimizer = torch.optim.Adam(model.parameters(), lr=args_dict["lr"])
+            criterion = nn.MSELoss()
+            best_val_loss = float("inf")
+            patience_counter = 0
+            best_state = None
+
+            for epoch in range(1, args_dict["epochs"] + 1):
+                model.train()
+                for x_cont, _, y in train_loader:
+                    x_cont, y = x_cont.to(device), y.to(device)
+                    optimizer.zero_grad()
+                    preds = model(x_cont)
+                    loss = criterion(preds, y)
+                    loss.backward()
+                    optimizer.step()
+
+                model.eval()
+                val_losses = []
+                with torch.no_grad():
+                    for x_cont, _, y in val_loader:
+                        x_cont, y = x_cont.to(device), y.to(device)
+                        preds = model(x_cont)
+                        val_losses.append(criterion(preds, y).item())
+                val_loss = np.mean(val_losses)
+
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                    if patience_counter >= 5:
+                        break
+
+            if best_state is not None:
+                model.load_state_dict(best_state)
+                model = model.to(device)
+
+            model.eval()
+            all_preds, all_targets = [], []
+            with torch.no_grad():
+                for x_cont, _, y in test_loader:
+                    x_cont = x_cont.to(device)
+                    preds = model(x_cont).cpu().numpy()
+                    all_preds.append(preds)
+                    all_targets.append(y.numpy())
+            preds_scaled   = np.concatenate(all_preds)
+            targets_scaled = np.concatenate(all_targets)
+
+            del model
+            torch.cuda.empty_cache()
+
+        from src.metrics import (
+            inverse_transform_predictions,
+            calculate_forecasting_metrics,
+            calculate_horizon_metrics,
+        )
+        preds_real, targets_real = inverse_transform_predictions(
+            preds_scaled, targets_scaled,
+            args_dict["scaler"], args_dict["target_idx"],
+        )
+        overall     = calculate_forecasting_metrics(targets_real, preds_real)
+        per_horizon = calculate_horizon_metrics(targets_real, preds_real)
+        elapsed = time.time() - t0
+
+        return {
+            "run":  run,
+            "RMSE": overall["RMSE"],
+            "MAE":  overall["MAE"],
+            "MAPE": overall["MAPE"],
+            "horizon_metrics": {str(h): m for h, m in per_horizon.items()},
+            "time_s": round(elapsed, 2),
+            "gpu_id": gpu_id,
+        }
+    except Exception as e:
+        logging.getLogger("grind").error(
+            "  [%s] Run %d on GPU %d FAILED: %s", model_name, run, gpu_id, e,
+        )
+        return None
+
+
+def run_baselines(log, n_gpus=1):
+    """Execute LSTM, BiLSTM, XGBoost on both datasets with parallel GPU runs."""
     import torch
     from src.models import StandardLSTM, BiLSTM, XGBoostBaseline
     from src.metrics import (
@@ -329,18 +486,19 @@ def run_baselines(log):
         calculate_forecasting_metrics,
         calculate_horizon_metrics,
     )
+    from concurrent.futures import ProcessPoolExecutor, as_completed
 
     device = _get_device()
     config = {
         "n_runs": N_RUNS, "window_size": WINDOW_SIZE, "horizon": HORIZON,
-        "batch_size": BATCH_SIZE,
+        "batch_size": BATCH_SIZE, "n_gpus": n_gpus,
         "dl_config": {"hidden_size": DL_HIDDEN_SIZE, "num_layers": DL_NUM_LAYERS,
                        "dropout": DL_DROPOUT, "epochs": DL_EPOCHS, "lr": DL_LR},
     }
 
     log.info("=" * 70)
     log.info("  PHASE 1: BASELINE EVALUATION (LSTM, BiLSTM, XGBoost)")
-    log.info("  Device: %s | N_RUNS: %d", device, N_RUNS)
+    log.info("  Device: %s | N_RUNS: %d | GPUs: %d", device, N_RUNS, n_gpus)
     log.info("=" * 70)
 
     models_to_run = [
@@ -361,80 +519,113 @@ def run_baselines(log):
         target_idx   = pipeline["target_idx"]
         n_features   = pipeline["n_continuous"]
 
+        # Pre-extract numpy arrays for worker processes
+        train_X_list, train_y_list = [], []
+        for x_cont, x_cat, y in train_loader:
+            train_X_list.append(x_cont.numpy())
+            train_y_list.append(y.numpy())
+        train_X = np.concatenate(train_X_list)
+        train_y = np.concatenate(train_y_list)
+
+        val_X_list, val_y_list = [], []
+        for x_cont, x_cat, y in val_loader:
+            val_X_list.append(x_cont.numpy())
+            val_y_list.append(y.numpy())
+        val_X = np.concatenate(val_X_list)
+        val_y = np.concatenate(val_y_list)
+
+        test_X_list, test_y_list = [], []
+        for x_cont, x_cat, y in test_loader:
+            test_X_list.append(x_cont.numpy())
+            test_y_list.append(y.numpy())
+        test_X = np.concatenate(test_X_list)
+        test_y = np.concatenate(test_y_list)
+
         for model_name, model_class, is_xgb in models_to_run:
             log.info("\n--- %s (%s-Grid) ---", model_name, ds_key.capitalize())
 
+            # Collect runs that still need to be done
+            pending_runs = []
             for run in range(1, N_RUNS + 1):
-                # ── Checkpoint check ──
                 data = _load_json(BASELINE_JSON)
                 if _is_run_done(data, ds_key, model_name, run):
                     log.info("  [%s] Skipping Run %d/%d (already completed)",
                              model_name, run, N_RUNS)
                     continue
+                pending_runs.append(run)
 
-                t0 = time.time()
-
-                if is_xgb:
-                    model = model_class(horizon=HORIZON)
-                    X_train_list, y_train_list = [], []
-                    for x_cont, x_cat, y in train_loader:
-                        X_train_list.append(x_cont.numpy())
-                        y_train_list.append(y.numpy())
-                    X_test_list, y_test_list = [], []
-                    for x_cont, x_cat, y in test_loader:
-                        X_test_list.append(x_cont.numpy())
-                        y_test_list.append(y.numpy())
-                    model.fit(np.concatenate(X_train_list),
-                              np.concatenate(y_train_list))
-                    preds_scaled   = model.predict(np.concatenate(X_test_list))
-                    targets_scaled = np.concatenate(y_test_list)
-                else:
-                    model = model_class(
-                        n_features=n_features,
-                        hidden_size=DL_HIDDEN_SIZE,
-                        num_layers=DL_NUM_LAYERS,
-                        dropout=DL_DROPOUT,
-                        horizon=HORIZON,
-                    )
-                    model = train_dl_model(
-                        model, train_loader, val_loader,
-                        epochs=DL_EPOCHS, lr=DL_LR, device=device,
-                    )
-                    preds_scaled, targets_scaled = predict_model(
-                        model, test_loader, device,
-                    )
-
-                preds_real, targets_real = inverse_transform_predictions(
-                    preds_scaled, targets_scaled, scaler, target_idx,
-                )
-                overall     = calculate_forecasting_metrics(targets_real, preds_real)
-                per_horizon = calculate_horizon_metrics(targets_real, preds_real)
-                elapsed = time.time() - t0
-
-                result = {
-                    "run":  run,
-                    "RMSE": overall["RMSE"],
-                    "MAE":  overall["MAE"],
-                    "MAPE": overall["MAPE"],
-                    "horizon_metrics": {str(h): m for h, m in per_horizon.items()},
-                    "time_s": round(elapsed, 2),
-                }
-
-                # ── Save immediately ──
+            if not pending_runs:
                 data = _load_json(BASELINE_JSON)
-                _save_run(BASELINE_JSON, data, ds_key, model_name, result, config)
+                _print_summary(log, f"{model_name} ({ds_key.capitalize()})",
+                               data, ds_key, model_name)
+                continue
 
-                log.info(
-                    "  [%s] Run %2d/%d | RMSE: %.4f | MAE: %.4f | "
-                    "MAPE: %.2f%% | %.1fs | SAVED",
-                    model_name, run, N_RUNS,
-                    overall["RMSE"], overall["MAE"], overall["MAPE"], elapsed,
-                )
+            # Build task dicts for each pending run
+            tasks = []
+            for i, run in enumerate(pending_runs):
+                tasks.append({
+                    "run": run,
+                    "model_name": model_name,
+                    "is_xgb": is_xgb,
+                    "gpu_id": i % n_gpus,
+                    "n_features": n_features,
+                    "horizon": HORIZON,
+                    "ds_key": ds_key,
+                    "train_X": train_X,
+                    "train_y": train_y,
+                    "test_X": test_X,
+                    "test_y": test_y,
+                    "val_X": val_X,
+                    "val_y": val_y,
+                    "scaler": scaler,
+                    "target_idx": target_idx,
+                    "batch_size": BATCH_SIZE,
+                    "hidden_size": DL_HIDDEN_SIZE,
+                    "num_layers": DL_NUM_LAYERS,
+                    "dropout": DL_DROPOUT,
+                    "epochs": DL_EPOCHS,
+                    "lr": DL_LR,
+                })
 
-                del model
-                if not is_xgb:
-                    torch.cuda.empty_cache()
-                gc.collect()
+            if n_gpus <= 1:
+                # Sequential fallback (single GPU)
+                for task in tasks:
+                    result = _baseline_worker(task)
+                    if result is not None:
+                        data = _load_json(BASELINE_JSON)
+                        _save_run(BASELINE_JSON, data, ds_key, model_name,
+                                  result, config)
+                        log.info(
+                            "  [%s] Run %2d/%d | RMSE: %.4f | MAE: %.4f | "
+                            "MAPE: %.2f%% | %.1fs | SAVED",
+                            model_name, result["run"], N_RUNS,
+                            result["RMSE"], result["MAE"], result["MAPE"],
+                            result["time_s"],
+                        )
+            else:
+                # Parallel execution across GPUs
+                ctx = torch.multiprocessing.get_context("spawn")
+                with ProcessPoolExecutor(max_workers=n_gpus,
+                                         mp_context=ctx) as executor:
+                    futures = {
+                        executor.submit(_baseline_worker, task): task["run"]
+                        for task in tasks
+                    }
+                    for future in as_completed(futures):
+                        run_id = futures[future]
+                        result = future.result()
+                        if result is not None:
+                            data = _load_json(BASELINE_JSON)
+                            _save_run(BASELINE_JSON, data, ds_key, model_name,
+                                      result, config)
+                            log.info(
+                                "  [%s] Run %2d/%d | GPU %d | RMSE: %.4f | "
+                                "MAE: %.4f | MAPE: %.2f%% | %.1fs | SAVED",
+                                model_name, result["run"], N_RUNS,
+                                result["gpu_id"],
+                                result["RMSE"], result["MAE"], result["MAPE"],
+                                result["time_s"],
+                            )
 
             # Print summary for this model/dataset combo
             data = _load_json(BASELINE_JSON)
@@ -888,7 +1079,7 @@ Plots:  Run Notebook 04 separately after all phases complete.
     wall_start = time.time()
 
     if args.all or args.baselines:
-        run_baselines(log)
+        run_baselines(log, n_gpus=n_gpus)
 
     if args.all or args.swarms:
         run_swarms(log, n_gpus=n_gpus)
