@@ -66,6 +66,7 @@ from src.models import BaseTFT
 __all__ = [
     "SearchSpace",
     "ObjectiveFunction",
+    "ParallelEvaluator",
     "AquilaOptimizer",
     "ParticleSwarm",
     "Hybrid_AO_PSO",
@@ -331,7 +332,7 @@ class ObjectiveFunction:
         n_batches = len(train_loader)
         n_subset = max(1, int(n_batches * subset_fraction))
         self._rng = np.random.default_rng(42)
-        self._subset_indices = sorted(
+        self._subset_indices = set(
             self._rng.choice(n_batches, size=n_subset, replace=False).tolist()
         )
 
@@ -348,16 +349,63 @@ class ObjectiveFunction:
             n_val_subset = n_val_batches
             self._val_subset_indices = None  # Use all
 
+        # Pre-materialize subset batches into CPU tensor lists.
+        # This avoids re-iterating the full DataLoader (and re-shuffling)
+        # on every __call__, ensuring all particles see identical data
+        # and eliminating ~70% wasted batch loads.
+        self._cached_train_batches: List[Tuple[torch.Tensor, ...]] = []
+        for batch_idx, batch in enumerate(self.train_loader):
+            if batch_idx in self._subset_indices:
+                self._cached_train_batches.append(batch)
+
+        self._cached_val_batches: List[Tuple[torch.Tensor, ...]] = []
+        for val_idx, batch in enumerate(self.val_loader):
+            if self._val_subset_indices is None or val_idx in self._val_subset_indices:
+                self._cached_val_batches.append(batch)
+
         logger.info(
-            "[ObjectiveFunction] Using %d/%d training batches (%.0f%%) "
+            "[ObjectiveFunction] Cached %d/%d training batches (%.0f%%) "
             "x %d proxy epochs on device='%s'",
-            n_subset, n_batches, subset_fraction * 100,
-            proxy_epochs, self.device,
+            len(self._cached_train_batches), n_batches,
+            subset_fraction * 100, proxy_epochs, self.device,
         )
         logger.info(
-            "[ObjectiveFunction] Using %d/%d validation batches (%.0f%%)",
-            n_val_subset, n_val_batches, val_subset_fraction * 100,
+            "[ObjectiveFunction] Cached %d/%d validation batches (%.0f%%)",
+            len(self._cached_val_batches), n_val_batches,
+            val_subset_fraction * 100,
         )
+
+    @classmethod
+    def from_cached_batches(
+        cls,
+        cached_train_batches: List[Tuple[torch.Tensor, ...]],
+        cached_val_batches: List[Tuple[torch.Tensor, ...]],
+        n_encoder_features: int,
+        window_size: int = 168,
+        horizon: int = 24,
+        proxy_epochs: int = 2,
+        device: str = "cuda",
+    ) -> "ObjectiveFunction":
+        """
+        Construct from pre-cached batch lists (for multi-GPU workers).
+
+        Avoids DataLoader pickling issues by receiving already-cached
+        CPU tensor triples directly.
+        """
+        instance = cls.__new__(cls)
+        instance._cached_train_batches = cached_train_batches
+        instance._cached_val_batches = cached_val_batches
+        instance.n_encoder_features = n_encoder_features
+        instance.window_size = window_size
+        instance.horizon = horizon
+        instance.proxy_epochs = proxy_epochs
+        instance.device = device
+        instance.train_loader = None
+        instance.val_loader = None
+        instance.subset_fraction = 0.0
+        instance.val_subset_fraction = 0.0
+        instance._eval_count = 0
+        return instance
 
     def __call__(self, position: np.ndarray) -> float:
         """
@@ -374,6 +422,8 @@ class ObjectiveFunction:
             Validation RMSE (lower is better).  Returns ``float('inf')``
             on any training/evaluation error (e.g. NaN loss, OOM).
         """
+        self._eval_count = getattr(self, "_eval_count", 0) + 1
+        t_start = time.time()
         params = decode_position(position)
 
         try:
@@ -398,10 +448,7 @@ class ObjectiveFunction:
 
             model.train()
             for _epoch in range(self.proxy_epochs):
-                for batch_idx, (x_cont, x_cat, y) in enumerate(self.train_loader):
-                    if batch_idx not in self._subset_indices:
-                        continue
-
+                for x_cont, x_cat, y in self._cached_train_batches:
                     x_cont = x_cont.to(self.device)
                     y = y.to(self.device)
 
@@ -428,11 +475,7 @@ class ObjectiveFunction:
             val_count = 0
 
             with torch.no_grad():
-                for val_idx, (x_cont, x_cat, y) in enumerate(self.val_loader):
-                    if (self._val_subset_indices is not None
-                            and val_idx not in self._val_subset_indices):
-                        continue
-
+                for x_cont, x_cat, y in self._cached_val_batches:
                     x_cont = x_cont.to(self.device)
                     y = y.to(self.device)
 
@@ -444,8 +487,22 @@ class ObjectiveFunction:
             val_rmse = math.sqrt(val_mse_sum / val_count)
 
             if math.isnan(val_rmse) or math.isinf(val_rmse):
+                logger.info(
+                    "[Particle %3d] NaN/Inf RMSE | d=%d L=%d H=%d | %.1fs",
+                    self._eval_count, params["d_model"],
+                    params["num_encoder_layers"], params["n_heads"],
+                    time.time() - t_start,
+                )
                 return float("inf")
 
+            logger.info(
+                "[Particle %3d] RMSE=%.6f | lr=%.2e d=%d L=%d H=%d "
+                "do=%.3f | %.1fs",
+                self._eval_count, val_rmse, params["learning_rate"],
+                params["d_model"], params["num_encoder_layers"],
+                params["n_heads"], params["dropout"],
+                time.time() - t_start,
+            )
             return val_rmse
 
         except Exception as e:
@@ -461,6 +518,203 @@ class ObjectiveFunction:
                 del model
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+
+# =====================================================================
+# SECTION 3B: MULTI-GPU PARALLEL EVALUATION
+# =====================================================================
+
+def _worker_loop(
+    gpu_id: int,
+    device: str,
+    cached_train_batches: List[Tuple[torch.Tensor, ...]],
+    cached_val_batches: List[Tuple[torch.Tensor, ...]],
+    obj_fn_config: Dict[str, Any],
+    task_queue,
+    result_queue,
+    shared_eval_count,
+):
+    """
+    Persistent worker process for parallel fitness evaluation.
+
+    Each worker creates its own ObjectiveFunction bound to a specific
+    CUDA device, then polls the task queue for positions to evaluate.
+    """
+    try:
+        torch.cuda.set_device(device)
+
+        obj_fn = ObjectiveFunction.from_cached_batches(
+            cached_train_batches=cached_train_batches,
+            cached_val_batches=cached_val_batches,
+            device=device,
+            **obj_fn_config,
+        )
+
+        result_queue.put(("READY", gpu_id, None))
+
+        while True:
+            msg = task_queue.get()
+            cmd, task_idx, payload = msg
+
+            if cmd == "SHUTDOWN":
+                break
+            elif cmd == "EVAL":
+                try:
+                    # Synchronise eval count across workers
+                    with shared_eval_count.get_lock():
+                        shared_eval_count.value += 1
+                        obj_fn._eval_count = shared_eval_count.value
+                    fitness = obj_fn(payload)
+                    result_queue.put(("RESULT", task_idx, fitness))
+                except Exception as e:
+                    result_queue.put(("ERROR", task_idx, str(e)))
+    except Exception as e:
+        result_queue.put(("ERROR", -1, f"Worker {gpu_id} fatal: {e}"))
+
+
+class ParallelEvaluator:
+    """
+    Multi-GPU parallel fitness evaluator using persistent worker processes.
+
+    Manages a pool of worker processes, each bound to a specific CUDA
+    device with its own ObjectiveFunction instance (including cached
+    batches).  Accepts a batch of position vectors and returns their
+    fitness values in parallel.
+
+    Parameters
+    ----------
+    main_obj_fn : ObjectiveFunction
+        The main-process ObjectiveFunction whose cached batches and
+        configuration will be shared with workers.
+    n_gpus : int
+        Number of GPU workers to spawn.
+    """
+
+    def __init__(self, main_obj_fn: ObjectiveFunction, n_gpus: int):
+        import torch.multiprocessing as mp
+
+        self.n_gpus = n_gpus
+        self._mp_ctx = mp.get_context("spawn")
+
+        # Extract cached data and config from the main ObjectiveFunction
+        self._cached_train = main_obj_fn._cached_train_batches
+        self._cached_val = main_obj_fn._cached_val_batches
+        self._obj_fn_config = {
+            "n_encoder_features": main_obj_fn.n_encoder_features,
+            "window_size": main_obj_fn.window_size,
+            "horizon": main_obj_fn.horizon,
+            "proxy_epochs": main_obj_fn.proxy_epochs,
+        }
+
+        self._task_queue = self._mp_ctx.Queue()
+        self._result_queue = self._mp_ctx.Queue()
+        self._shared_eval_count = self._mp_ctx.Value("i", 0)
+        self._workers: List = []
+        self._started = False
+
+    def start(self):
+        """Spawn persistent worker processes, one per GPU."""
+        if self._started:
+            return
+
+        for gpu_id in range(self.n_gpus):
+            device = f"cuda:{gpu_id}"
+            p = self._mp_ctx.Process(
+                target=_worker_loop,
+                args=(
+                    gpu_id,
+                    device,
+                    self._cached_train,
+                    self._cached_val,
+                    self._obj_fn_config,
+                    self._task_queue,
+                    self._result_queue,
+                    self._shared_eval_count,
+                ),
+                daemon=True,
+            )
+            p.start()
+            self._workers.append(p)
+
+        # Wait for all workers to signal ready
+        ready_count = 0
+        while ready_count < self.n_gpus:
+            msg = self._result_queue.get(timeout=120)
+            if msg[0] == "READY":
+                ready_count += 1
+
+        self._started = True
+        logger.info("[ParallelEvaluator] %d GPU workers ready", self.n_gpus)
+
+    def evaluate_batch(self, positions: List[np.ndarray]) -> List[float]:
+        """
+        Evaluate a list of positions in parallel across GPUs.
+
+        Returns fitness values in the same order as input positions.
+        """
+        n = len(positions)
+
+        # Submit all tasks
+        for idx, pos in enumerate(positions):
+            self._task_queue.put(("EVAL", idx, pos))
+
+        # Collect results (may arrive out of order)
+        results: Dict[int, float] = {}
+        for _ in range(n):
+            try:
+                msg = self._result_queue.get(timeout=600)
+                if msg[0] == "RESULT":
+                    _, task_idx, fitness = msg
+                    results[task_idx] = fitness
+                elif msg[0] == "ERROR":
+                    _, task_idx, error_msg = msg
+                    logger.warning(
+                        "[ParallelEvaluator] Worker error for task %d: %s",
+                        task_idx, error_msg,
+                    )
+                    results[task_idx] = float("inf")
+            except Exception as e:
+                logger.error("[ParallelEvaluator] Queue timeout: %s", e)
+                for i in range(n):
+                    if i not in results:
+                        results[i] = float("inf")
+                break
+
+        return [results.get(i, float("inf")) for i in range(n)]
+
+    def shutdown(self):
+        """Send shutdown signals and join all worker processes."""
+        if not self._started:
+            return
+        for _ in self._workers:
+            self._task_queue.put(("SHUTDOWN", None, None))
+        for w in self._workers:
+            w.join(timeout=30)
+            if w.is_alive():
+                w.terminate()
+        self._started = False
+        logger.info("[ParallelEvaluator] All workers shut down")
+
+    def __del__(self):
+        try:
+            self.shutdown()
+        except Exception:
+            pass
+
+
+def _evaluate_positions(
+    positions: List[np.ndarray],
+    objective_fn: ObjectiveFunction,
+    parallel_evaluator: Optional["ParallelEvaluator"] = None,
+) -> List[float]:
+    """
+    Evaluate a list of positions, using parallel GPUs if available.
+
+    Falls back to sequential evaluation when parallel_evaluator is None.
+    """
+    if parallel_evaluator is not None:
+        return parallel_evaluator.evaluate_batch(positions)
+    return [objective_fn(pos) for pos in positions]
 
 
 # =====================================================================
@@ -520,6 +774,9 @@ class AquilaOptimizer:
         Random seed for reproducibility.
     checkpoint_dir : str or None
         Directory for JSON checkpoints.  None = no checkpointing.
+    parallel_evaluator : ParallelEvaluator or None
+        Multi-GPU evaluator.  When provided, particle evaluations are
+        distributed across GPUs.  None = sequential (single GPU).
     """
 
     def __init__(
@@ -529,11 +786,13 @@ class AquilaOptimizer:
         max_iter: int = 50,
         seed: int = 42,
         checkpoint_dir: Optional[str] = None,
+        parallel_evaluator: Optional["ParallelEvaluator"] = None,
     ):
         self.objective_fn = objective_fn
         self.pop_size = pop_size
         self.max_iter = max_iter
         self.checkpoint_dir = checkpoint_dir
+        self.parallel_evaluator = parallel_evaluator
 
         self.rng = np.random.default_rng(seed)
 
@@ -624,12 +883,23 @@ class AquilaOptimizer:
             self.pop_size, self.max_iter,
         )
 
-        # --- Initial population evaluation ---
+        # --- Initial population evaluation (parallel-safe) ---
+        logger.info("[AO] Evaluating initial population (%d eagles)...",
+                    self.pop_size)
+        initial_positions = [self.population[i] for i in range(self.pop_size)]
+        initial_fitness = _evaluate_positions(
+            initial_positions, self.objective_fn, self.parallel_evaluator,
+        )
         for i in range(self.pop_size):
-            self.fitness[i] = self.objective_fn(self.population[i])
+            self.fitness[i] = initial_fitness[i]
             if self.fitness[i] < self.global_best_fit:
                 self.global_best_fit = self.fitness[i]
                 self.global_best_pos = self.population[i].copy()
+            logger.info(
+                "[AO] Init %2d/%d | fit=%.6f | best_so_far=%.6f",
+                i + 1, self.pop_size, self.fitness[i],
+                self.global_best_fit,
+            )
 
         start_time = time.time()
 
@@ -642,19 +912,13 @@ class AquilaOptimizer:
             # Mean position of the population (centroid)
             X_mean = self.population.mean(axis=0)
 
+            # ── Phase 1: Generate all candidate positions ─────────
+            # (sequential, deterministic rng — order matters)
+            new_positions = []
             for i in range(self.pop_size):
                 r = self.rng.random()  # Phase selection threshold
 
                 # ── Phase 1: Expanded Exploration ────────────────
-                # Condition: early stage AND r favours exploration
-                # Mimics high-altitude soaring using thermals.
-                # The eagle leverages the global best and population
-                # centroid for broad spatial coverage.
-                #
-                #   X_new = X_best * (1 - t/T) + X_mean - X_rand_j
-                #
-                # As t/T increases, the X_best contribution shrinks,
-                # shifting weight towards the centroid (exploitation).
                 if progress <= (2 / 3) and r <= 0.5:
                     j = self.rng.integers(0, self.pop_size)
                     X_new = (
@@ -664,18 +928,6 @@ class AquilaOptimizer:
                     )
 
                 # ── Phase 2: Narrowed Exploration ────────────────
-                # Condition: early stage AND r favours targeted search
-                # Mimics contour flight -- circling prey at medium
-                # altitude using a Lévy-modulated spiral.
-                #
-                #   X_new = X_best * Levy(D) + X_rand_j +
-                #           (y - x) * rand
-                #
-                # where:
-                #   x = r1 * sin(theta), y = r1 * cos(theta)
-                #   r1 = 2 * pi * rand,  theta = -pi + 2*pi*rand
-                # The spiral trajectory + Lévy flight creates a rich
-                # search pattern around the best-known region.
                 elif progress <= (2 / 3) and r > 0.5:
                     j = self.rng.integers(0, self.pop_size)
                     levy = self._levy_flight(N_DIMS)
@@ -691,17 +943,6 @@ class AquilaOptimizer:
                     )
 
                 # ── Phase 3: Expanded Exploitation ───────────────
-                # Condition: late stage AND r favours broad refinement
-                # Mimics the eagle's slow controlled descent towards
-                # the prey, approaching from a computed angle.
-                #
-                #   alpha = delta = 0.1 (small perturbation)
-                #   X_new = (X_best - X_mean) * alpha
-                #           - rand(D)
-                #           + ((UB - LB) * rand + LB) * delta
-                #
-                # The (X_best - X_mean) term orients movement towards
-                # the best, while alpha/delta constrain step magnitude.
                 elif progress > (2 / 3) and r <= 0.5:
                     alpha = 0.1
                     delta = 0.1
@@ -716,20 +957,6 @@ class AquilaOptimizer:
                     )
 
                 # ── Phase 4: Narrowed Exploitation ───────────────
-                # Condition: late stage AND r favours precision search
-                # Mimics the final "walk and grab" attack pattern.
-                #
-                #   QF = t^{(2*rand - 1)} * (1 - t/T)^2
-                #   G1 = 2 * rand - 1
-                #   G2 = 2 * (1 - t/T)
-                #   X_new = QF * X_best
-                #           - (G1 * population[i] * rand)
-                #           - G2 * Levy(D) + rand(D) * G1
-                #
-                # QF (Quality Function) decays quadratically with
-                # progress, ensuring micro-scale adjustments in the
-                # final iterations.  G2 also decays, further
-                # reducing Lévy jump magnitude.
                 else:  # progress > 2/3 and r > 0.5
                     QF = t ** (2 * self.rng.random() - 1) * (1 - progress) ** 2
                     G1 = 2 * self.rng.random() - 1  # ∈ [-1, 1]
@@ -743,18 +970,23 @@ class AquilaOptimizer:
                         + self.rng.random(N_DIMS) * G1
                     )
 
-                # ── Enforce constraints and evaluate ─────────────
                 X_new = _enforce_constraints(X_new)
-                new_fit = self.objective_fn(X_new)
+                new_positions.append(X_new)
 
-                # Greedy selection: keep new position only if better
-                if new_fit < self.fitness[i]:
-                    self.population[i] = X_new
-                    self.fitness[i] = new_fit
+            # ── Phase 2: Evaluate all candidates (parallel-safe) ──
+            new_fitness = _evaluate_positions(
+                new_positions, self.objective_fn, self.parallel_evaluator,
+            )
 
-                    if new_fit < self.global_best_fit:
-                        self.global_best_fit = new_fit
-                        self.global_best_pos = X_new.copy()
+            # ── Phase 3: Greedy selection (sequential) ────────────
+            for i in range(self.pop_size):
+                if new_fitness[i] < self.fitness[i]:
+                    self.population[i] = new_positions[i]
+                    self.fitness[i] = new_fitness[i]
+
+                    if new_fitness[i] < self.global_best_fit:
+                        self.global_best_fit = new_fitness[i]
+                        self.global_best_pos = new_positions[i].copy()
 
             # ── Iteration logging ────────────────────────────────
             elapsed = time.time() - start_time
@@ -876,6 +1108,9 @@ class ParticleSwarm:
         Random seed for reproducibility.
     checkpoint_dir : str or None
         Directory for JSON checkpoints.
+    parallel_evaluator : ParallelEvaluator or None
+        Multi-GPU evaluator.  When provided, particle evaluations are
+        distributed across GPUs.  None = sequential (single GPU).
     """
 
     def __init__(
@@ -889,6 +1124,7 @@ class ParticleSwarm:
         w_min: float = 0.4,
         seed: int = 42,
         checkpoint_dir: Optional[str] = None,
+        parallel_evaluator: Optional["ParallelEvaluator"] = None,
     ):
         self.objective_fn = objective_fn
         self.pop_size = pop_size
@@ -898,6 +1134,7 @@ class ParticleSwarm:
         self.w_max = w_max
         self.w_min = w_min
         self.checkpoint_dir = checkpoint_dir
+        self.parallel_evaluator = parallel_evaluator
 
         self.rng = np.random.default_rng(seed)
 
@@ -995,16 +1232,26 @@ class ParticleSwarm:
             self.w_max, self.w_min,
         )
 
-        # --- Initial population evaluation ---
+        # --- Initial population evaluation (parallel-safe) ---
         # Skip if state was already injected (Hybrid hand-off)
         if self.g_best_fit == float("inf"):
+            logger.info("[PSO] Evaluating initial population (%d particles)...",
+                        self.pop_size)
+            initial_positions = [self.positions[i] for i in range(self.pop_size)]
+            initial_fitness = _evaluate_positions(
+                initial_positions, self.objective_fn, self.parallel_evaluator,
+            )
             for i in range(self.pop_size):
-                fit = self.objective_fn(self.positions[i])
-                self.p_best_fit[i] = fit
+                self.p_best_fit[i] = initial_fitness[i]
                 self.p_best_pos[i] = self.positions[i].copy()
-                if fit < self.g_best_fit:
-                    self.g_best_fit = fit
+                if initial_fitness[i] < self.g_best_fit:
+                    self.g_best_fit = initial_fitness[i]
                     self.g_best_pos = self.positions[i].copy()
+                logger.info(
+                    "[PSO] Init %2d/%d | fit=%.6f | best_so_far=%.6f",
+                    i + 1, self.pop_size, initial_fitness[i],
+                    self.g_best_fit,
+                )
 
         start_time = time.time()
 
@@ -1016,6 +1263,7 @@ class ParticleSwarm:
             # Low w late:   particles decelerate → exploitation
             w = self.w_max - (self.w_max - self.w_min) * (t / self.max_iter)
 
+            # ── Phase 1: Update velocities & positions (sequential, rng) ──
             for i in range(self.pop_size):
                 r1 = self.rng.random(N_DIMS)  # per-dimension random
                 r2 = self.rng.random(N_DIMS)
@@ -1050,17 +1298,20 @@ class ParticleSwarm:
                 # ── Enforce boundary & divisibility constraints ──
                 self.positions[i] = _enforce_constraints(self.positions[i])
 
-                # ── Evaluate fitness ─────────────────────────────
-                fit = self.objective_fn(self.positions[i])
+            # ── Phase 2: Evaluate all particles (parallel-safe) ──
+            current_positions = [self.positions[i] for i in range(self.pop_size)]
+            fitness_values = _evaluate_positions(
+                current_positions, self.objective_fn, self.parallel_evaluator,
+            )
 
-                # Update personal best
-                if fit < self.p_best_fit[i]:
-                    self.p_best_fit[i] = fit
+            # ── Phase 3: Update personal & global bests (sequential) ──
+            for i in range(self.pop_size):
+                if fitness_values[i] < self.p_best_fit[i]:
+                    self.p_best_fit[i] = fitness_values[i]
                     self.p_best_pos[i] = self.positions[i].copy()
 
-                    # Update global best
-                    if fit < self.g_best_fit:
-                        self.g_best_fit = fit
+                    if fitness_values[i] < self.g_best_fit:
+                        self.g_best_fit = fitness_values[i]
                         self.g_best_pos = self.positions[i].copy()
 
             # ── Iteration logging ────────────────────────────────
@@ -1204,6 +1455,9 @@ class Hybrid_AO_PSO:
         PSO maximum inertia weight.
     pso_w_min : float
         PSO minimum inertia weight.
+    parallel_evaluator : ParallelEvaluator or None
+        Multi-GPU evaluator.  When provided, particle evaluations are
+        distributed across GPUs.  None = sequential (single GPU).
     """
 
     def __init__(
@@ -1218,6 +1472,7 @@ class Hybrid_AO_PSO:
         pso_c2: float = 2.0,
         pso_w_max: float = 0.9,
         pso_w_min: float = 0.4,
+        parallel_evaluator: Optional["ParallelEvaluator"] = None,
     ):
         self.objective_fn = objective_fn
         self.pop_size = pop_size
@@ -1225,6 +1480,7 @@ class Hybrid_AO_PSO:
         self.ao_fraction = ao_fraction
         self.seed = seed
         self.checkpoint_dir = checkpoint_dir
+        self.parallel_evaluator = parallel_evaluator
 
         # Iteration budget allocation
         self.ao_iter = max(1, int(total_iter * ao_fraction))
@@ -1271,6 +1527,7 @@ class Hybrid_AO_PSO:
             max_iter=self.ao_iter,
             seed=self.seed,
             checkpoint_dir=self.checkpoint_dir,
+            parallel_evaluator=self.parallel_evaluator,
         )
 
         ao_best_params, ao_best_fit, ao_convergence = ao.optimize()
@@ -1304,6 +1561,7 @@ class Hybrid_AO_PSO:
             w_min=self.pso_w_min,
             seed=self.seed + 1000,  # Different seed for PSO phase
             checkpoint_dir=self.checkpoint_dir,
+            parallel_evaluator=self.parallel_evaluator,
         )
 
         # Inject AO's discovered landscape into PSO

@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """
-run_experiments.py -- Headless 10x Grind Protocol Runner (v2: Crash-Resilient)
-===============================================================================
+run_experiments.py -- Headless 7x Grind Protocol Runner (v2.1: Compute-Efficient)
+=================================================================================
 
 Consolidates Notebooks 01-03 into a single CLI application for SSH-resilient
 execution on Vast.ai (or any headless GPU server).
+
+v2.1 METHODOLOGY PIVOT:
+  - Optimizer convergence (Group A): 7 runs x 30 iterations (pilot study
+    confirmed best_fitness plateau by iteration 6, swarm mean by iteration 29).
+  - Each run already trains + evaluates a full TFT with the discovered
+    champion hyperparameters, so optimizer reliability is tested across
+    all 7 discovered configurations.
 
 CHECKPOINTING: Results are saved to disk after *every single run*. If the
 process crashes or SSH drops, simply re-launch the same command. The script
@@ -44,7 +51,7 @@ os.chdir(PROJECT_ROOT)
 # =====================================================================
 # Configuration
 # =====================================================================
-N_RUNS          = 10
+N_RUNS          = 7       # v2.1: 7 runs (was 10) for Wilcoxon power (min p≈0.008)
 WINDOW_SIZE     = 168
 HORIZON         = 24
 BATCH_SIZE      = 64
@@ -59,8 +66,8 @@ DL_LR           = 1e-3
 
 # Swarm / Hybrid optimizer settings
 POP_SIZE        = 20
-MAX_ITER        = 50      # For standalone AO / PSO
-TOTAL_ITER      = 50      # For Hybrid (AO + PSO combined)
+MAX_ITER        = 30      # v2.1: 30 iter (was 50) -- pilot confirmed plateau by iter 6
+TOTAL_ITER      = 30      # v2.1: 30 iter (was 50) -- for Hybrid (AO + PSO combined)
 AO_FRACTION     = 0.5
 PROXY_EPOCHS    = 2
 SUBSET_FRACTION = 0.3
@@ -104,6 +111,11 @@ def setup_logging():
     fh = logging.FileHandler(str(log_path), mode="a", encoding="utf-8")
     fh.setFormatter(fmt)
     root.addHandler(fh)
+
+    # Force immediate flushing so per-particle logs appear in real time
+    # (Python buffers stdout when it's not connected to a TTY, e.g. in
+    # nohup, tmux, Jupyter subprocess, or Vast.ai terminal sessions).
+    sys.stdout.reconfigure(line_buffering=True)
 
     return logging.getLogger("grind")
 
@@ -440,11 +452,13 @@ def run_baselines(log):
 # =====================================================================
 # Phase 2: Standalone Swarms (Notebook 02)
 # =====================================================================
-def run_swarms(log):
+def run_swarms(log, n_gpus=1):
     """Execute Pure AO and Pure PSO on both datasets with checkpointing."""
     import torch
     from src.models import BaseTFT
-    from src.optimizers import ObjectiveFunction, AquilaOptimizer, ParticleSwarm
+    from src.optimizers import (
+        ObjectiveFunction, AquilaOptimizer, ParticleSwarm, ParallelEvaluator,
+    )
     from src.metrics import (
         inverse_transform_predictions,
         calculate_forecasting_metrics,
@@ -458,12 +472,13 @@ def run_swarms(log):
         "val_subset_fraction": VAL_SUBSET_FRAC,
         "full_epochs": FULL_EPOCHS, "patience": PATIENCE,
         "window_size": WINDOW_SIZE, "horizon": HORIZON, "batch_size": BATCH_SIZE,
+        "n_gpus": n_gpus,
     }
 
     log.info("=" * 70)
     log.info("  PHASE 2: STANDALONE SWARM EVALUATION (Pure AO, Pure PSO)")
-    log.info("  Device: %s | N_RUNS: %d | POP: %d | ITER: %d",
-             device, N_RUNS, POP_SIZE, MAX_ITER)
+    log.info("  Device: %s | N_RUNS: %d | POP: %d | ITER: %d | GPUs: %d",
+             device, N_RUNS, POP_SIZE, MAX_ITER, n_gpus)
     log.info("  [System] Using val_subset_fraction=%.1f and num_workers=%d "
              "for proxy evaluations.", VAL_SUBSET_FRAC, NUM_WORKERS)
     log.info("=" * 70)
@@ -485,19 +500,215 @@ def run_swarms(log):
         target_idx   = pipeline["target_idx"]
         n_features   = pipeline["n_continuous"]
 
-        for opt_name, opt_class in optimizers_to_run:
-            log.info("\n### %s (%s-Grid) -- 10x Grind ###",
-                     opt_name, ds_key.capitalize())
+        # ── Per-dataset ParallelEvaluator lifecycle ──
+        # Create one evaluator that persists across all runs and both
+        # optimizers for this dataset, avoiding repeated worker spawn
+        # overhead.  Falls back to None (sequential) for n_gpus <= 1.
+        parallel_eval = None
+        if n_gpus > 1:
+            # Build a reference ObjectiveFunction for cached batch extraction
+            ref_obj_fn = ObjectiveFunction(
+                train_loader=train_loader, val_loader=val_loader,
+                n_encoder_features=n_features, window_size=WINDOW_SIZE,
+                horizon=HORIZON, proxy_epochs=PROXY_EPOCHS,
+                subset_fraction=SUBSET_FRACTION,
+                val_subset_fraction=VAL_SUBSET_FRAC, device=device,
+            )
+            parallel_eval = ParallelEvaluator(ref_obj_fn, n_gpus=n_gpus)
+            parallel_eval.start()
+            del ref_obj_fn
+            log.info("  [Multi-GPU] ParallelEvaluator started with %d workers "
+                     "for %s-grid", n_gpus, ds_key)
 
+        try:
+            for opt_name, opt_class in optimizers_to_run:
+                log.info("\n### %s (%s-Grid) -- 7x Grind (v2.1) ###",
+                         opt_name, ds_key.capitalize())
+
+                for run in range(1, N_RUNS + 1):
+                    # ── Checkpoint check ──
+                    data = _load_json(SWARM_JSON)
+                    if _is_run_done(data, ds_key, opt_name, run):
+                        log.info("  [%s] Skipping Run %d/%d (already completed)",
+                                 opt_name, run, N_RUNS)
+                        continue
+
+                    log.info("\n  [%s] Run %d/%d", opt_name, run, N_RUNS)
+                    t0 = time.time()
+
+                    # -- Optimization --
+                    obj_fn = ObjectiveFunction(
+                        train_loader=train_loader, val_loader=val_loader,
+                        n_encoder_features=n_features, window_size=WINDOW_SIZE,
+                        horizon=HORIZON, proxy_epochs=PROXY_EPOCHS,
+                        subset_fraction=SUBSET_FRACTION,
+                        val_subset_fraction=VAL_SUBSET_FRAC, device=device,
+                    )
+                    swarm = opt_class(
+                        objective_fn=obj_fn, pop_size=POP_SIZE,
+                        max_iter=MAX_ITER, seed=run,
+                        parallel_evaluator=parallel_eval,
+                    )
+                    best_params, best_fitness, convergence = swarm.optimize()
+                    opt_time = time.time() - t0
+
+                    log.info("  Optimization: %.1fs | Proxy RMSE: %.6f",
+                             opt_time, best_fitness)
+                    for k, v in best_params.items():
+                        log.info("    %s: %s", k, v)
+
+                    # -- Full training --
+                    t1 = time.time()
+                    model = BaseTFT(
+                        n_encoder_features=n_features, n_decoder_features=0,
+                        n_static_categoricals=0,
+                        d_model=best_params["d_model"],
+                        n_heads=best_params["n_heads"],
+                        num_encoder_layers=best_params["num_encoder_layers"],
+                        dropout=best_params["dropout"],
+                        horizon=HORIZON, window_size=WINDOW_SIZE,
+                    )
+                    model = train_tft_full(
+                        model, train_loader, val_loader,
+                        epochs=FULL_EPOCHS, lr=best_params["learning_rate"],
+                        device=device,
+                    )
+                    train_time = time.time() - t1
+
+                    # -- Evaluation --
+                    preds_scaled, targets_scaled = predict_model(
+                        model, test_loader, device,
+                    )
+                    preds_real, targets_real = inverse_transform_predictions(
+                        preds_scaled, targets_scaled, scaler, target_idx,
+                    )
+                    overall     = calculate_forecasting_metrics(targets_real, preds_real)
+                    per_horizon = calculate_horizon_metrics(targets_real, preds_real)
+                    total_time  = time.time() - t0
+
+                    result = {
+                        "run":            run,
+                        "RMSE":           overall["RMSE"],
+                        "MAE":            overall["MAE"],
+                        "MAPE":           overall["MAPE"],
+                        "horizon_metrics": {str(h): m for h, m in per_horizon.items()},
+                        "best_params":    best_params,
+                        "proxy_fitness":  best_fitness,
+                        "convergence":    convergence.to_dict(),
+                        "opt_time_s":     round(opt_time, 2),
+                        "train_time_s":   round(train_time, 2),
+                        "total_time_s":   round(total_time, 2),
+                    }
+
+                    # ── Save immediately ──
+                    data = _load_json(SWARM_JSON)
+                    _save_run(SWARM_JSON, data, ds_key, opt_name, result, config)
+
+                    log.info(
+                        "  [%s] Run %2d COMPLETE | RMSE: %.4f | MAE: %.4f | "
+                        "MAPE: %.2f%% | %.1fs | SAVED",
+                        opt_name, run,
+                        overall["RMSE"], overall["MAE"], overall["MAPE"], total_time,
+                    )
+
+                    del model, swarm, obj_fn, convergence
+                    torch.cuda.empty_cache()
+                    gc.collect()
+
+                data = _load_json(SWARM_JSON)
+                _print_summary(log, f"{opt_name} ({ds_key.capitalize()})",
+                               data, ds_key, opt_name)
+        finally:
+            if parallel_eval is not None:
+                parallel_eval.shutdown()
+                log.info("  [Multi-GPU] ParallelEvaluator shut down for %s-grid",
+                         ds_key)
+
+        del pipeline
+        torch.cuda.empty_cache()
+        gc.collect()
+
+    log.info("\n>>> STANDALONE SWARM TESTING COMPLETE <<<")
+    log.info("  Results: %s", SWARM_JSON)
+
+
+# =====================================================================
+# Phase 3: Hybrid AO-PSO Champion (Notebook 03)
+# =====================================================================
+def run_hybrid(log, n_gpus=1):
+    """Execute Hybrid AO-PSO on both datasets with checkpointing."""
+    import torch
+    from src.models import BaseTFT
+    from src.optimizers import (
+        ObjectiveFunction, Hybrid_AO_PSO, ParallelEvaluator,
+    )
+    from src.metrics import (
+        inverse_transform_predictions,
+        calculate_forecasting_metrics,
+        calculate_horizon_metrics,
+    )
+
+    device = _get_device()
+    config = {
+        "n_runs": N_RUNS, "pop_size": POP_SIZE, "total_iter": TOTAL_ITER,
+        "ao_fraction": AO_FRACTION, "proxy_epochs": PROXY_EPOCHS,
+        "subset_fraction": SUBSET_FRACTION, "val_subset_fraction": VAL_SUBSET_FRAC,
+        "full_epochs": FULL_EPOCHS, "patience": PATIENCE,
+        "window_size": WINDOW_SIZE, "horizon": HORIZON, "batch_size": BATCH_SIZE,
+        "n_gpus": n_gpus,
+    }
+
+    log.info("=" * 70)
+    log.info("  PHASE 3: CHAMPION EVALUATION (Hybrid AO-PSO)")
+    log.info("  Device: %s | N_RUNS: %d | POP: %d | TOTAL_ITER: %d | AO_FRAC: %.1f | GPUs: %d",
+             device, N_RUNS, POP_SIZE, TOTAL_ITER, AO_FRACTION, n_gpus)
+    log.info("  [System] Using val_subset_fraction=%.1f and num_workers=%d "
+             "for proxy evaluations.", VAL_SUBSET_FRAC, NUM_WORKERS)
+    log.info("=" * 70)
+
+    model_name = "Hybrid_AO_PSO"
+
+    for ds_key, ds_path, ds_type in [
+        ("micro", MICRO_PATH, "micro"),
+        ("macro", MACRO_PATH, "macro"),
+    ]:
+        pipeline = _load_pipeline(ds_path, ds_type, log)
+        train_loader = pipeline["train_loader"]
+        val_loader   = pipeline["val_loader"]
+        test_loader  = pipeline["test_loader"]
+        scaler       = pipeline["scaler"]
+        target_idx   = pipeline["target_idx"]
+        n_features   = pipeline["n_continuous"]
+
+        log.info("\n### Hybrid AO-PSO (%s-Grid) -- 7x Grind (v2.1) ###",
+                 ds_key.capitalize())
+
+        # ── Per-dataset ParallelEvaluator lifecycle ──
+        parallel_eval = None
+        if n_gpus > 1:
+            ref_obj_fn = ObjectiveFunction(
+                train_loader=train_loader, val_loader=val_loader,
+                n_encoder_features=n_features, window_size=WINDOW_SIZE,
+                horizon=HORIZON, proxy_epochs=PROXY_EPOCHS,
+                subset_fraction=SUBSET_FRACTION,
+                val_subset_fraction=VAL_SUBSET_FRAC, device=device,
+            )
+            parallel_eval = ParallelEvaluator(ref_obj_fn, n_gpus=n_gpus)
+            parallel_eval.start()
+            del ref_obj_fn
+            log.info("  [Multi-GPU] ParallelEvaluator started with %d workers "
+                     "for %s-grid", n_gpus, ds_key)
+
+        try:
             for run in range(1, N_RUNS + 1):
                 # ── Checkpoint check ──
-                data = _load_json(SWARM_JSON)
-                if _is_run_done(data, ds_key, opt_name, run):
-                    log.info("  [%s] Skipping Run %d/%d (already completed)",
-                             opt_name, run, N_RUNS)
+                data = _load_json(HYBRID_JSON)
+                if _is_run_done(data, ds_key, model_name, run):
+                    log.info("  [Hybrid] Skipping Run %d/%d (already completed)",
+                             run, N_RUNS)
                     continue
 
-                log.info("\n  [%s] Run %d/%d", opt_name, run, N_RUNS)
+                log.info("\n  [Hybrid AO-PSO] Run %d/%d", run, N_RUNS)
                 t0 = time.time()
 
                 # -- Optimization --
@@ -508,15 +719,21 @@ def run_swarms(log):
                     subset_fraction=SUBSET_FRACTION,
                     val_subset_fraction=VAL_SUBSET_FRAC, device=device,
                 )
-                swarm = opt_class(
+                hybrid = Hybrid_AO_PSO(
                     objective_fn=obj_fn, pop_size=POP_SIZE,
-                    max_iter=MAX_ITER, seed=run,
+                    total_iter=TOTAL_ITER, ao_fraction=AO_FRACTION, seed=run,
+                    parallel_evaluator=parallel_eval,
                 )
-                best_params, best_fitness, convergence = swarm.optimize()
+                best_params, best_fitness, convergence = hybrid.optimize()
                 opt_time = time.time() - t0
 
-                log.info("  Optimization: %.1fs | Proxy RMSE: %.6f",
-                         opt_time, best_fitness)
+                ao_iters = sum(1 for r in convergence.history
+                               if r.get("phase") == "AO")
+                pso_iters = sum(1 for r in convergence.history
+                                if r.get("phase") == "PSO")
+                log.info("  Optimization: %.1fs | AO iters: %d | PSO iters: %d "
+                         "| Proxy RMSE: %.6f",
+                         opt_time, ao_iters, pso_iters, best_fitness)
                 for k, v in best_params.items():
                     log.info("    %s: %s", k, v)
 
@@ -564,176 +781,27 @@ def run_swarms(log):
                 }
 
                 # ── Save immediately ──
-                data = _load_json(SWARM_JSON)
-                _save_run(SWARM_JSON, data, ds_key, opt_name, result, config)
+                data = _load_json(HYBRID_JSON)
+                _save_run(HYBRID_JSON, data, ds_key, model_name, result, config)
 
                 log.info(
-                    "  [%s] Run %2d COMPLETE | RMSE: %.4f | MAE: %.4f | "
+                    "  [Hybrid] Run %2d COMPLETE | RMSE: %.4f | MAE: %.4f | "
                     "MAPE: %.2f%% | %.1fs | SAVED",
-                    opt_name, run,
-                    overall["RMSE"], overall["MAE"], overall["MAPE"], total_time,
+                    run, overall["RMSE"], overall["MAE"], overall["MAPE"], total_time,
                 )
 
-                del model, swarm, obj_fn, convergence
+                del model, hybrid, obj_fn, convergence
                 torch.cuda.empty_cache()
                 gc.collect()
 
-            data = _load_json(SWARM_JSON)
-            _print_summary(log, f"{opt_name} ({ds_key.capitalize()})",
-                           data, ds_key, opt_name)
-
-        del pipeline
-        torch.cuda.empty_cache()
-        gc.collect()
-
-    log.info("\n>>> STANDALONE SWARM TESTING COMPLETE <<<")
-    log.info("  Results: %s", SWARM_JSON)
-
-
-# =====================================================================
-# Phase 3: Hybrid AO-PSO Champion (Notebook 03)
-# =====================================================================
-def run_hybrid(log):
-    """Execute Hybrid AO-PSO on both datasets with checkpointing."""
-    import torch
-    from src.models import BaseTFT
-    from src.optimizers import ObjectiveFunction, Hybrid_AO_PSO
-    from src.metrics import (
-        inverse_transform_predictions,
-        calculate_forecasting_metrics,
-        calculate_horizon_metrics,
-    )
-
-    device = _get_device()
-    config = {
-        "n_runs": N_RUNS, "pop_size": POP_SIZE, "total_iter": TOTAL_ITER,
-        "ao_fraction": AO_FRACTION, "proxy_epochs": PROXY_EPOCHS,
-        "subset_fraction": SUBSET_FRACTION, "val_subset_fraction": VAL_SUBSET_FRAC,
-        "full_epochs": FULL_EPOCHS, "patience": PATIENCE,
-        "window_size": WINDOW_SIZE, "horizon": HORIZON, "batch_size": BATCH_SIZE,
-    }
-
-    log.info("=" * 70)
-    log.info("  PHASE 3: CHAMPION EVALUATION (Hybrid AO-PSO)")
-    log.info("  Device: %s | N_RUNS: %d | POP: %d | TOTAL_ITER: %d | AO_FRAC: %.1f",
-             device, N_RUNS, POP_SIZE, TOTAL_ITER, AO_FRACTION)
-    log.info("  [System] Using val_subset_fraction=%.1f and num_workers=%d "
-             "for proxy evaluations.", VAL_SUBSET_FRAC, NUM_WORKERS)
-    log.info("=" * 70)
-
-    model_name = "Hybrid_AO_PSO"
-
-    for ds_key, ds_path, ds_type in [
-        ("micro", MICRO_PATH, "micro"),
-        ("macro", MACRO_PATH, "macro"),
-    ]:
-        pipeline = _load_pipeline(ds_path, ds_type, log)
-        train_loader = pipeline["train_loader"]
-        val_loader   = pipeline["val_loader"]
-        test_loader  = pipeline["test_loader"]
-        scaler       = pipeline["scaler"]
-        target_idx   = pipeline["target_idx"]
-        n_features   = pipeline["n_continuous"]
-
-        log.info("\n### Hybrid AO-PSO (%s-Grid) -- 10x Grind ###",
-                 ds_key.capitalize())
-
-        for run in range(1, N_RUNS + 1):
-            # ── Checkpoint check ──
             data = _load_json(HYBRID_JSON)
-            if _is_run_done(data, ds_key, model_name, run):
-                log.info("  [Hybrid] Skipping Run %d/%d (already completed)",
-                         run, N_RUNS)
-                continue
-
-            log.info("\n  [Hybrid AO-PSO] Run %d/%d", run, N_RUNS)
-            t0 = time.time()
-
-            # -- Optimization --
-            obj_fn = ObjectiveFunction(
-                train_loader=train_loader, val_loader=val_loader,
-                n_encoder_features=n_features, window_size=WINDOW_SIZE,
-                horizon=HORIZON, proxy_epochs=PROXY_EPOCHS,
-                subset_fraction=SUBSET_FRACTION,
-                val_subset_fraction=VAL_SUBSET_FRAC, device=device,
-            )
-            hybrid = Hybrid_AO_PSO(
-                objective_fn=obj_fn, pop_size=POP_SIZE,
-                total_iter=TOTAL_ITER, ao_fraction=AO_FRACTION, seed=run,
-            )
-            best_params, best_fitness, convergence = hybrid.optimize()
-            opt_time = time.time() - t0
-
-            ao_iters = sum(1 for r in convergence.history
-                           if r.get("phase") == "AO")
-            pso_iters = sum(1 for r in convergence.history
-                            if r.get("phase") == "PSO")
-            log.info("  Optimization: %.1fs | AO iters: %d | PSO iters: %d "
-                     "| Proxy RMSE: %.6f",
-                     opt_time, ao_iters, pso_iters, best_fitness)
-            for k, v in best_params.items():
-                log.info("    %s: %s", k, v)
-
-            # -- Full training --
-            t1 = time.time()
-            model = BaseTFT(
-                n_encoder_features=n_features, n_decoder_features=0,
-                n_static_categoricals=0,
-                d_model=best_params["d_model"],
-                n_heads=best_params["n_heads"],
-                num_encoder_layers=best_params["num_encoder_layers"],
-                dropout=best_params["dropout"],
-                horizon=HORIZON, window_size=WINDOW_SIZE,
-            )
-            model = train_tft_full(
-                model, train_loader, val_loader,
-                epochs=FULL_EPOCHS, lr=best_params["learning_rate"],
-                device=device,
-            )
-            train_time = time.time() - t1
-
-            # -- Evaluation --
-            preds_scaled, targets_scaled = predict_model(
-                model, test_loader, device,
-            )
-            preds_real, targets_real = inverse_transform_predictions(
-                preds_scaled, targets_scaled, scaler, target_idx,
-            )
-            overall     = calculate_forecasting_metrics(targets_real, preds_real)
-            per_horizon = calculate_horizon_metrics(targets_real, preds_real)
-            total_time  = time.time() - t0
-
-            result = {
-                "run":            run,
-                "RMSE":           overall["RMSE"],
-                "MAE":            overall["MAE"],
-                "MAPE":           overall["MAPE"],
-                "horizon_metrics": {str(h): m for h, m in per_horizon.items()},
-                "best_params":    best_params,
-                "proxy_fitness":  best_fitness,
-                "convergence":    convergence.to_dict(),
-                "opt_time_s":     round(opt_time, 2),
-                "train_time_s":   round(train_time, 2),
-                "total_time_s":   round(total_time, 2),
-            }
-
-            # ── Save immediately ──
-            data = _load_json(HYBRID_JSON)
-            _save_run(HYBRID_JSON, data, ds_key, model_name, result, config)
-
-            log.info(
-                "  [Hybrid] Run %2d COMPLETE | RMSE: %.4f | MAE: %.4f | "
-                "MAPE: %.2f%% | %.1fs | SAVED",
-                run, overall["RMSE"], overall["MAE"], overall["MAPE"], total_time,
-            )
-
-            del model, hybrid, obj_fn, convergence
-            torch.cuda.empty_cache()
-            gc.collect()
-
-        data = _load_json(HYBRID_JSON)
-        _print_summary(log, f"Hybrid AO-PSO-TFT ({ds_key.capitalize()})",
-                       data, ds_key, model_name)
+            _print_summary(log, f"Hybrid AO-PSO-TFT ({ds_key.capitalize()})",
+                           data, ds_key, model_name)
+        finally:
+            if parallel_eval is not None:
+                parallel_eval.shutdown()
+                log.info("  [Multi-GPU] ParallelEvaluator shut down for %s-grid",
+                         ds_key)
 
         del pipeline
         torch.cuda.empty_cache()
@@ -748,7 +816,7 @@ def run_hybrid(log):
 # =====================================================================
 def main():
     parser = argparse.ArgumentParser(
-        description="10x Grind Protocol -- Crash-resilient headless experiment "
+        description="7x Grind Protocol v2.1 -- Crash-resilient headless experiment "
                     "runner for Hybrid AO-PSO-TFT energy forecasting research.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
@@ -773,6 +841,10 @@ Plots:  Run Notebook 04 separately after all phases complete.
                         help="Run Hybrid AO-PSO champion (Notebook 03)")
     parser.add_argument("--all", action="store_true",
                         help="Run the complete pipeline: baselines -> swarms -> hybrid")
+    parser.add_argument("--n-gpus", type=int, default=None,
+                        help="Number of GPUs for parallel particle evaluation "
+                             "(default: auto-detect via torch.cuda.device_count(). "
+                             "Use 1 for sequential single-GPU mode)")
 
     args = parser.parse_args()
 
@@ -783,8 +855,18 @@ Plots:  Run Notebook 04 separately after all phases complete.
     log = setup_logging()
     RESULTS_DIR.mkdir(exist_ok=True)
 
+    # ── GPU count resolution ──
+    import torch
+    if args.n_gpus is not None:
+        n_gpus = args.n_gpus
+    else:
+        n_gpus = max(1, torch.cuda.device_count())
+    log.info("  GPU count: %d (%s)", n_gpus,
+             "user-specified" if args.n_gpus is not None else "auto-detected")
+
     log.info("=" * 70)
-    log.info("  10x GRIND PROTOCOL -- Crash-Resilient Experiment Runner v2")
+    log.info("  10x GRIND PROTOCOL v2.1 -- Crash-Resilient Experiment Runner")
+    log.info("  (7 runs x 30 iter -- pilot-validated convergence cutoff)")
     log.info("  Project root: %s", PROJECT_ROOT)
     log.info("=" * 70)
 
@@ -809,10 +891,10 @@ Plots:  Run Notebook 04 separately after all phases complete.
         run_baselines(log)
 
     if args.all or args.swarms:
-        run_swarms(log)
+        run_swarms(log, n_gpus=n_gpus)
 
     if args.all or args.hybrid:
-        run_hybrid(log)
+        run_hybrid(log, n_gpus=n_gpus)
 
     wall_total = time.time() - wall_start
     hours = int(wall_total // 3600)

@@ -259,7 +259,7 @@ class XGBoostBaseline:
         Additional keyword arguments forwarded to
         ``xgboost.XGBRegressor``.  Common keys include
         ``n_estimators``, ``max_depth``, ``learning_rate``,
-        ``subsample``, ``tree_method='gpu_hist'`` for CUDA, etc.
+        ``subsample``, ``device='cpu'`` to force CPU, etc.
     """
 
     def __init__(self, horizon=24, **xgb_params):
@@ -274,18 +274,21 @@ class XGBoostBaseline:
         # Sensible defaults for hourly energy forecasting regression.
         # Users may override any of these via **xgb_params.
         defaults = {
-            'n_estimators': 500,
+            'n_estimators': 200,
             'max_depth': 6,
             'learning_rate': 0.05,
             'subsample': 0.8,
             'colsample_bytree': 0.8,
             'objective': 'reg:squarederror',
-            'tree_method': 'hist',    # use 'gpu_hist' for CUDA acceleration
+            'tree_method': 'hist',
+            'device': 'cuda',
             'random_state': 42,
         }
         defaults.update(xgb_params)
 
-        self.model = MultiOutputRegressor(xgb.XGBRegressor(**defaults))
+        self.model = MultiOutputRegressor(
+            xgb.XGBRegressor(**defaults), n_jobs=-1
+        )
         self._is_fitted = False
 
     @staticmethod
